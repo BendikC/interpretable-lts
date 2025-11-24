@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 
 #Parse arguments
 parser = argparse.ArgumentParser()
-parser.add_argument('--config', type=str, default ='./default.ini' , help='path to the config file')
+parser.add_argument('--config', type=str, default ='./configs/default.ini' , help='path to the config file')
 args = parser.parse_args()
 
 #Get configs

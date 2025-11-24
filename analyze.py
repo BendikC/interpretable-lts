@@ -28,7 +28,7 @@ from analysis.visualization import (
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description='Analyze trained VAE')
-    parser.add_argument('--config', type=str, default='./default.ini',
+    parser.add_argument('--config', type=str, default='./configs/default.ini',
                        help='Path to training config file (same as used for training)')
     parser.add_argument('--n-samples', type=int, default=1000,
                        help='Number of samples for analysis')
