@@ -299,7 +299,7 @@ if not continue_training:
           # Combined centroid loss
           centroid_loss = (
             tf.reduce_mean(tf.square(predicted_centroid - input_centroid)) + 
-            tf.reduce_mean(tf.square(input_centroid - output_centroid))
+            tf.reduce_mean(tf.square(predicted_centroid - output_centroid))
           )
           centroid_loss = tf.clip_by_value(centroid_loss, 0.0, 2.0)
         
