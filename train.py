@@ -123,31 +123,32 @@ print("Workspace: {}".format(workdir))
 
 #create the dataset
 print('creating the dataset...')
-training_array = []
-new_loop = True
+training_list = []  # Changed from training_array
 
 for f in os.listdir(my_cqt): 
     if f.endswith('.npy'):
         print('adding-> %s' % f)
         file_path = my_cqt / f
-        new_array = np.load(file_path)
-        if new_loop:
-            training_array = new_array
-            new_loop = False
-        else:
-            training_array = np.concatenate((training_array, new_array), axis=0)
+        new_array = np.load(file_path)  # Shape: (501, 336)
+        
+        # Crop to 496 frames (divisible by 16 = 4*4)
+        new_array = new_array[:496, :]  # Shape: (496, 336)
+        
+        training_list.append(new_array)
 
-total_cqt = len(training_array)
-print('Total number of CQT frames: {}'.format(total_cqt))
+print(f'Total number of sounds: {len(training_list)}')
+print(f'Example shape: {training_list[0].shape}')
+
+total_cqt = sum(arr.shape[0] for arr in training_list)
+print('Total number of CQT frames across all sounds: {}'.format(total_cqt))
 config['dataset']['total_frames'] = str(total_cqt)
 
-print("saving initial configs...")
-config_path = workdir / 'config.ini'
-with open(config_path, 'w') as configfile:
-  config.write(configfile)
+# Convert list to numpy array
+training_array = np.array(training_list, dtype='float32')  # Shape: (n_sounds, 501, 336)
+print(f'Training array shape: {training_array.shape}')
 
 if buffer_size_dataset:
-  train_buf = len(training_array)
+  train_buf = len(training_array)  # Number of sounds, not frames
 
 #Define Sampling Layer
 class Sampling(layers.Layer):
@@ -168,22 +169,40 @@ log_dir = workdir / 'logs'
 os.makedirs(log_dir, exist_ok=True)
 
 if not continue_training:
-  # Define encoder model.
-  original_dim = n_bins
-  original_inputs = tf.keras.Input(shape=(original_dim,), name='encoder_input')
-  x = layers.Dense(n_units, activation='relu')(original_inputs)
+  time_frames = training_array.shape[1]
+  original_inputs = tf.keras.Input(shape=(time_frames, n_bins), name='encoder_input')
+  
+  # Conv1D approach - MUCH faster!
+  x = layers.Conv1D(128, kernel_size=5, activation='relu', padding='same')(original_inputs)
+  x = layers.MaxPooling1D(4)(x)  # (501, 336) → (125, 336)
+  x = layers.Conv1D(256, kernel_size=5, activation='relu', padding='same')(x)
+  x = layers.MaxPooling1D(4)(x)  # (125, 336) → (31, 256)
+  x = layers.Flatten()(x)  # 31 × 256 = 7,936 (much smaller!)
+  
+  x = layers.Dense(n_units, activation='relu')(x)
   z_mean = layers.Dense(latent_dim, name='z_mean')(x)
   z_log_var = layers.Dense(latent_dim, name='z_log_var')(x)
   z = Sampling()((z_mean, z_log_var))
   encoder = tf.keras.Model(inputs=original_inputs, outputs=[z_mean, z_log_var, z], name='encoder')
-  encoder.summary()
-
-  # Define decoder model.
+  
+  # Decoder needs transpose convolutions
   latent_inputs = tf.keras.Input(shape=(latent_dim,), name='z_sampling')
   x = layers.Dense(n_units, activation='relu')(latent_inputs)
-  outputs = layers.Dense(original_dim, activation=VAE_output_activation)(x)
+  x = layers.Dense(31 * 256, activation='relu')(x)
+  x = layers.Reshape((31, 256))(x)
+  
+  x = layers.UpSampling1D(4)(x)  # (31, 256) → (124, 256)
+  x = layers.Conv1D(128, kernel_size=5, activation='relu', padding='same')(x)
+  x = layers.UpSampling1D(4)(x)  # (124, 128) → (496, 128)
+  x = layers.Conv1D(n_bins, kernel_size=5, padding='same')(x)  # → (496, 336)
+  
+  # Pad or crop to match original time_frames
+  outputs = layers.Lambda(lambda x: x[:, :time_frames, :])(x)
+  
+  if VAE_output_activation != 'relu':
+      outputs = layers.Activation(VAE_output_activation)(outputs)
+  
   decoder = tf.keras.Model(inputs=latent_inputs, outputs=outputs, name='decoder')
-  decoder.summary()
 
   # Define VAE model with custom loss including spectral centroid
   class VAE(tf.keras.Model):
@@ -344,7 +363,7 @@ if not continue_training:
     fmin=fmin,
     bins_per_octave=bins_per_octave
   )
-  vae.build(input_shape=(None, original_dim))
+  vae.build(input_shape=(None, time_frames, n_bins))
   vae.summary()
   
   print(f"\n=== VAE Configuration ===")
@@ -457,19 +476,50 @@ for f in random_subset:
   y_inv_32 = librosa.griffinlim_cqt(C, sr=fs, n_iter=n_iter, hop_length=hop_length, bins_per_octave=bins_per_octave, dtype=np.float32)
   
   ## Generate the same CQT using the model
-  my_array = np.transpose(C_32)
-  test_dataset = tf.data.Dataset.from_tensor_slices(my_array).batch(batch_size).prefetch(AUTOTUNE)
-  output = tf.constant(0., dtype='float32', shape=(1,n_bins))
-  print("Working on regenerating cqt magnitudes with the DL model")
-  for step, x_batch_train in enumerate(test_dataset):
-    reconstructed = vae(x_batch_train)
-    output = tf.concat([output, reconstructed], 0)
+  # Transpose and prepare as temporal sequence
+  my_array = np.transpose(C_32)  # Shape: (time_frames, n_bins)
+  
+  # Crop/pad to match training length (496 frames)
+  if my_array.shape[0] > time_frames:
+      my_array = my_array[:time_frames, :]
+  elif my_array.shape[0] < time_frames:
+      # Pad with zeros if too short
+      padding = np.zeros((time_frames - my_array.shape[0], n_bins), dtype='float32')
+      my_array = np.concatenate([my_array, padding], axis=0)
+  
+  # Add batch dimension: (1, time_frames, n_bins)
+  my_array = np.expand_dims(my_array, axis=0)
 
-  output_np = np.transpose(output.numpy())
-  output_inv_32 = librosa.griffinlim_cqt(output_np[1:], 
-    sr=fs, n_iter=n_iter, hop_length=hop_length, bins_per_octave=bins_per_octave, dtype=np.float32)
+  print(f"Input shape for VAE: {my_array.shape}")
+  print("Working on regenerating cqt magnitudes with the DL model")
+  
+  # Pass entire sequence through VAE at once
+  reconstructed = vae(my_array)  # Shape: (1, time_frames, n_bins)
+  
+  # Remove batch dimension and transpose back
+  output_np = reconstructed[0].numpy()  # Shape: (time_frames, n_bins)
+  output_np = np.transpose(output_np)   # Shape: (n_bins, time_frames)
+  
+  # Crop to original length if we padded
+  original_length = C.shape[1]
+  if output_np.shape[1] > original_length:
+      output_np = output_np[:, :original_length]
+  
+  print(f"Output CQT shape: {output_np.shape}")
+  
+  # Invert CQT
+  output_inv_32 = librosa.griffinlim_cqt(
+      output_np, 
+      sr=fs, 
+      n_iter=n_iter, 
+      hop_length=hop_length, 
+      bins_per_octave=bins_per_octave, 
+      dtype=np.float32
+  )
+  
   if normalize_examples:
     output_inv_32 = librosa.util.normalize(output_inv_32)
+  
   print("Saving audio files...")
   my_audio_out_fold = my_examples_folder / os.path.splitext(f)[0]
   os.makedirs(my_audio_out_fold, exist_ok=True)
