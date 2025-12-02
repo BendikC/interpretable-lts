@@ -18,6 +18,8 @@ import random
 import json
 import matplotlib.pyplot as plt
 
+from train_utils.audio_features import compute_spectral_centroid
+
 #Parse arguments
 parser = argparse.ArgumentParser()
 parser.add_argument('--config', type=str, default ='./configs/default.ini' , help='path to the config file')
@@ -147,49 +149,6 @@ with open(config_path, 'w') as configfile:
 if buffer_size_dataset:
   train_buf = len(training_array)
 
-# Spectral centroid computation function
-def compute_spectral_centroid_tf(cqt_magnitude, fmin=32.7, bins_per_octave=48):
-    """Compute spectral centroid using proper frequency mapping."""
-
-    # first we ensure non-negative and add small epsilon
-    cqt_magnitude = tf.abs(cqt_magnitude) + 1e-8
-
-    # we get the number of bins, and we define the indices as floats
-    n_bins = tf.shape(cqt_magnitude)[1]
-    bin_indices = tf.cast(tf.range(n_bins), tf.float32)
-    
-    # cqt bins are logarithmically spaced
-    # this means that frequency for each bin is:
-    # f = fmin * 2^(bin_index / bins_per_octave)
-    frequencies = fmin * tf.pow(2.0, bin_indices / bins_per_octave)
-
-    # we expand the dims to match the batch size
-    frequencies = tf.expand_dims(frequencies, 0)
-    
-    # we compute the sum of frequency * magnitude
-    weighted_freq = tf.reduce_sum(cqt_magnitude * frequencies, axis=1)
-
-    # then we compute the total magnitude
-    total_magnitude = tf.reduce_sum(cqt_magnitude, axis=1)
-
-    # spectral centroid = weighted frequency sum / total magnitude
-    centroid_hz = weighted_freq / (total_magnitude + 1e-8)
-    
-    # Clamp centroid to valid frequency range before log
-    fmax = fmin * tf.pow(2.0, tf.cast(n_bins, tf.float32) / bins_per_octave)
-    centroid_hz = tf.clip_by_value(centroid_hz, fmin, fmax)
-    
-    # Normalize to [0, 1] using logarithmic scale
-    # log(centroid/fmin) / log(fmax/fmin)
-    log_centroid = tf.math.log(centroid_hz / fmin + 1e-8)
-    log_range = tf.math.log(fmax / fmin + 1e-8)
-    centroid_normalized = log_centroid / log_range
-    
-    # Final clamp to [0, 1] (safety net)
-    centroid_normalized = tf.clip_by_value(centroid_normalized, 0.0, 1.0)
-    
-    return centroid_normalized
-
 #Define Sampling Layer
 class Sampling(layers.Layer):
   """Uses (z_mean, z_log_var) to sample z, the vector encoding a digit."""
@@ -278,7 +237,7 @@ if not continue_training:
         centroid_loss = tf.constant(0.0)
         if self.spectral_centroid_weight > 0:
           # Compute actual centroid from input
-          input_centroid = compute_spectral_centroid_tf(
+          input_centroid = compute_spectral_centroid(
             data, 
             fmin=self.fmin, 
             bins_per_octave=self.bins_per_octave
@@ -290,7 +249,7 @@ if not continue_training:
           predicted_centroid = tf.nn.sigmoid(z_centroid_dim)
 
           # compute centroid from reconstruction
-          output_centroid = compute_spectral_centroid_tf(
+          output_centroid = compute_spectral_centroid(
             reconstruction, 
             fmin=self.fmin, 
             bins_per_octave=self.bins_per_octave
@@ -340,12 +299,12 @@ if not continue_training:
       
       centroid_loss = tf.constant(0.0)
       if self.spectral_centroid_weight > 0:
-        input_centroid = compute_spectral_centroid_tf(
+        input_centroid = compute_spectral_centroid(
           data, 
           fmin=self.fmin, 
           bins_per_octave=self.bins_per_octave
         )
-        output_centroid = compute_spectral_centroid_tf(
+        output_centroid = compute_spectral_centroid(
           reconstruction, 
           fmin=self.fmin, 
           bins_per_octave=self.bins_per_octave
